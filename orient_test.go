@@ -13,6 +13,7 @@ import (
 	"github.com/fsouza/go-dockerclient"
 	"gopkg.in/istreamdata/orientgo.v2"
 	_ "gopkg.in/istreamdata/orientgo.v2/obinary"
+	"reflect"
 )
 
 var orientVersion = "2.1"
@@ -35,10 +36,6 @@ func init() {
 	go func() {
 		fmt.Println("pprof: ", http.ListenAndServe(":6060", nil))
 	}()
-}
-
-func TestBuild(t *testing.T) {
-
 }
 
 func TestNewDB(t *testing.T) {
@@ -404,7 +401,7 @@ func TestSQLQueryParams(t *testing.T) {
 	notShort(t)
 	db, closer := SpinOrientAndOpenDB(t, false)
 	defer closer()
-	defer catch()
+	defer catch(t)
 	SeedDB(t, db)
 
 	var doc *orient.Document
@@ -420,7 +417,7 @@ func TestSQLCommandParams(t *testing.T) {
 	notShort(t)
 	db, closer := SpinOrientAndOpenDB(t, false)
 	defer closer()
-	defer catch()
+	defer catch(t)
 	SeedDB(t, db)
 
 	var doc *orient.Document
@@ -436,7 +433,7 @@ func TestSQLCommandParamsCustomType(t *testing.T) {
 	notShort(t)
 	db, closer := SpinOrientAndOpenDB(t, false)
 	defer closer()
-	defer catch()
+	defer catch(t)
 	SeedDB(t, db)
 
 	type Age int
@@ -470,7 +467,7 @@ func TestSQLInnerStruct(t *testing.T) {
 	notShort(t)
 	db, closer := SpinOrientAndOpenDB(t, false)
 	defer closer()
-	defer catch()
+	defer catch(t)
 	SeedDB(t, db)
 
 	type Inner struct {
@@ -498,11 +495,85 @@ func TestSQLInnerStruct(t *testing.T) {
 	}
 }
 
+func TestSQLStructSelect(t *testing.T) {
+	notShort(t)
+	db, closer := SpinOrientAndOpenDB(t, false)
+	defer closer()
+	defer catch(t)
+
+	type Item struct {
+		Name string
+	}
+
+	arr := []Item{
+		{Name: "one"}, {Name: "two"},
+	}
+
+	for _, it := range arr {
+		doc := orient.NewDocument("V")
+		if err := doc.From(it); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.CreateRecord(doc); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	{
+		var out []Item
+		err := db.Command(orient.NewSQLQuery(`SELECT * FROM V WHERE Name IS NOT NULL`)).All(&out)
+		if err != nil {
+			t.Fatal(err)
+		} else if !reflect.DeepEqual(arr, out) {
+			t.Fatal("wrong results")
+		}
+
+		out = nil
+		err = db.Command(orient.NewSQLQuery(`SELECT * FROM V WHERE Name = "one"`)).All(&out)
+		if err != nil {
+			t.Fatal(err)
+		} else if !reflect.DeepEqual(arr[:1], out) {
+			t.Fatal("wrong results")
+		}
+
+		out = nil
+		err = db.Command(orient.NewSQLQuery(`SELECT * FROM V WHERE Name = "unk"`)).All(&out)
+		if err != nil {
+			t.Fatal(err)
+		} else if len(out) != 0 {
+			t.Fatal("wrong results")
+		}
+	}
+	{
+		var out *Item
+		err := db.Command(orient.NewSQLQuery(`SELECT * FROM V WHERE Name IS NOT NULL`)).All(&out)
+		if err == nil {
+			t.Fatal("error expected")
+		} else if _, ok := err.(orient.ErrMultipleRecords); !ok {
+			t.Fatal("wrong error type returned")
+		}
+
+		out = nil
+		err = db.Command(orient.NewSQLQuery(`SELECT * FROM V WHERE Name = "one"`)).All(&out)
+		if err != nil {
+			t.Fatal(err)
+		} else if !reflect.DeepEqual(&arr[0], out) {
+			t.Fatal("wrong results")
+		}
+
+		out = nil
+		err = db.Command(orient.NewSQLQuery(`SELECT * FROM V WHERE Name = "unk"`)).All(&out)
+		if err != orient.ErrNoRecord {
+			t.Fatal("wrong error type returned")
+		}
+	}
+}
+
 func TestNativeInnerStruct(t *testing.T) {
 	notShort(t)
 	db, closer := SpinOrientAndOpenDB(t, false)
 	defer closer()
-	defer catch()
+	defer catch(t)
 	SeedDB(t, db)
 
 	type Inner struct {
@@ -540,7 +611,7 @@ func TestSQLBatchParams(t *testing.T) {
 	notShort(t)
 	db, closer := SpinOrientAndOpenDB(t, false)
 	defer closer()
-	defer catch()
+	defer catch(t)
 	SeedDB(t, db)
 
 	var doc *orient.Document
@@ -552,5 +623,59 @@ func TestSQLBatchParams(t *testing.T) {
 		t.Fatal(err)
 	} else if doc.GetField("name").Value.(string) != "Linus" {
 		t.Fatal("wrong field value")
+	}
+}
+
+func TestSelectDocumentAsMap(t *testing.T) {
+	cli, closer := SpinOrientAndOpenDB(t, false)
+	defer closer()
+
+	type Item struct {
+		Name string
+	}
+	var out map[string]*Item
+	err := cli.Command(orient.NewScriptCommand(orient.LangJS, `
+var docs = (new com.orientechnologies.orient.core.record.impl.ODocument()).fromJSON('{"one":{"Name":"record"}}'); docs`,
+	)).All(&out)
+	if err != nil {
+		t.Fatal(err)
+	} else if len(out) != 1 {
+		t.Error("wrong docs count")
+	} else if !reflect.DeepEqual(out, map[string]*Item{"one": &Item{"record"}}) {
+		t.Error("wrong data returned")
+	}
+}
+
+func TestConcurrentModification(t *testing.T) {
+	notShort(t)
+	db, closer := SpinOrientAndOpenDB(t, false)
+	defer closer()
+	defer catch(t)
+
+	const n = 5
+
+	doc := orient.NewEmptyDocument()
+	doc.SetField("name", "")
+	err := db.CreateRecord(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pause := make(chan struct{})
+	errc := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			<-pause
+			errc <- db.Command(orient.NewSQLCommand(
+				fmt.Sprintf(`UPDATE %s SET name=?`, doc.RID),
+				fmt.Sprintf("data%d", i),
+			)).Err()
+		}(i)
+	}
+	close(pause)
+	for i := 0; i < n; i++ {
+		if err := <-errc; err != nil {
+			t.Errorf("(%T): %v", err, err)
+		}
 	}
 }

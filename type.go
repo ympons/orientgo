@@ -1,7 +1,7 @@
 package orient
 
 import (
-	"github.com/golang/glog"
+	"log"
 	"reflect"
 	"time"
 	"unsafe"
@@ -209,6 +209,8 @@ func OTypeForValue(val interface{}) (ftype OType) {
 		ftype = LINKLIST
 	case *RidBag:
 		ftype = LINKBAG
+	case time.Time:
+		ftype = DATETIME
 	// TODO: more types need to be added
 	default:
 		if isDecimal(val) {
@@ -244,12 +246,20 @@ func OTypeForValue(val interface{}) (ftype OType) {
 			} else {
 				ftype = LONG
 			}
+		case reflect.Uint:
+			if intSize == 4 {
+				ftype = INTEGER
+			} else {
+				ftype = LONG
+			}
+		case reflect.Uint64:
+			ftype = LONG
 		case reflect.String:
 			ftype = STRING
 		case reflect.Struct:
 			ftype = EMBEDDED
 		default:
-			glog.Warningf("unknown type in serialization: %T, kind: %v", val, reflect.TypeOf(val).Kind())
+			log.Printf("unknown type in serialization: %T, kind: %v", val, reflect.TypeOf(val).Kind())
 		}
 	}
 	return

@@ -6,7 +6,6 @@ import (
 	"time"
 
 	//	"database/sql/driver"
-	//	"github.com/golang/glog"
 	"reflect"
 	"strings"
 )
@@ -53,11 +52,23 @@ func NewDocument(className string) *Document {
 	return doc
 }
 
-// TODO: have this replace NewDocument and change NewDocument to take RID and Version (???)
+// NewEmptyDocument creates new empty document.
 func NewEmptyDocument() *Document {
 	return &Document{
 		BytesRecord: BytesRecord{
 			RID:  NewEmptyRID(),
+			Vers: -1,
+		},
+		fields: make(map[string]*DocEntry),
+		ser:    GetDefaultRecordSerializer(),
+	}
+}
+
+// NewDocumentFromRID creates new empty document with given RID.
+func NewDocumentFromRID(rid RID) *Document {
+	return &Document{
+		BytesRecord: BytesRecord{
+			RID:  rid,
 			Vers: -1,
 		},
 		fields: make(map[string]*DocEntry),
@@ -91,6 +102,8 @@ func (doc *Document) Content() ([]byte, error) {
 	// TODO: can track field changes and invalidate content if necessary - no need to serialize each time
 	if doc.serialized {
 		return doc.BytesRecord.Content()
+	} else if doc.ser == nil {
+		return nil, fmt.Errorf("document is not serialized and no serializer is set")
 	}
 	buf := bytes.NewBuffer(nil)
 	if err := doc.ser.ToStream(buf, doc); err != nil {

@@ -2,7 +2,11 @@ package orient_test
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
+	"os"
+	"os/exec"
+	"runtime"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -10,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/glog"
 	"gopkg.in/istreamdata/orientgo.v2"
 )
 
@@ -18,9 +21,9 @@ func init() {
 	rand.Seed(time.Now().UTC().UnixNano())
 }
 
-func catch() {
+func catch(t testing.TB) {
 	if r := recover(); r != nil {
-		glog.Errorf("panic recovery: %v\nTrace:\n%s\n", r, debug.Stack())
+		t.Fatalf("panic recovery: %v\nTrace:\n%s\n", r, debug.Stack())
 	}
 }
 func notShort(t *testing.T) {
@@ -29,11 +32,71 @@ func notShort(t *testing.T) {
 	}
 }
 
+func TestFDLeak(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.SkipNow()
+	}
+	openedFDs := func() int {
+		out, err := exec.Command("lsof", "-p", fmt.Sprint(os.Getpid())).Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Count(string(out), "\n") - 1
+	}
+	addr, rm := SpinOrientServer(t)
+	defer rm()
+
+	leak := func() {
+		client, err := orient.Dial(addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := client.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}()
+
+		dbName := "leak_test"
+		admin, err := client.Auth(srvUser, srvPass)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if ok, _ := admin.DatabaseExists(dbName, orient.Persistent); !ok {
+			err = admin.CreateDatabase(dbName, orient.GraphDB, orient.Persistent)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		db, err := client.Open(dbName, orient.GraphDB, dbUser, dbPass)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Closing Database session pool
+		defer func() {
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}()
+	}
+	fds := openedFDs()
+	for i := 0; i < 1; i++ {
+		leak()
+	}
+	time.Sleep(time.Second)
+	if n := openedFDs(); n != fds {
+		t.Fatalf("leaked fd: %d != %d", n, fds)
+	}
+}
+
 func TestInitialize(t *testing.T) {
 	notShort(t)
 	dbc, closer := SpinOrient(t)
 	defer closer()
-	defer catch()
+	defer catch(t)
 
 	sess, err := dbc.Auth(srvUser, srvPass)
 	Nil(t, err)
@@ -87,7 +150,7 @@ func TestRecordsNativeAPIStructs(t *testing.T) {
 	notShort(t)
 	db, closer := SpinOrientAndOpenDB(t, false)
 	defer closer()
-	defer catch()
+	defer catch(t)
 	SeedDB(t, db)
 
 	type Cat struct {
@@ -171,7 +234,7 @@ func TestRecordsNativeAPI(t *testing.T) {
 	notShort(t)
 	db, closer := SpinOrientAndOpenDB(t, false)
 	defer closer()
-	defer catch()
+	defer catch(t)
 	SeedDB(t, db)
 
 	// ---[ creation ]---
@@ -269,7 +332,7 @@ func TestRecordsWithDate(t *testing.T) {
 	notShort(t)
 	db, closer := SpinOrientAndOpenDB(t, false)
 	defer closer()
-	defer catch()
+	defer catch(t)
 	SeedDB(t, db)
 
 	err := db.Command(orient.NewSQLCommand("CREATE PROPERTY Cat.bday DATE")).Err()
@@ -321,7 +384,7 @@ func TestRecordsWithDatetime(t *testing.T) {
 	notShort(t)
 	db, closer := SpinOrientAndOpenDB(t, false)
 	defer closer()
-	defer catch()
+	defer catch(t)
 	SeedDB(t, db)
 
 	err := db.Command(orient.NewSQLCommand("CREATE PROPERTY Cat.ddd DATETIME")).Err()
@@ -372,7 +435,7 @@ func TestRecordsMismatchedTypes(t *testing.T) {
 	notShort(t)
 	db, closer := SpinOrientAndOpenDB(t, false)
 	defer closer()
-	defer catch()
+	defer catch(t)
 	SeedDB(t, db)
 
 	c1 := orient.NewDocument("Cat")
@@ -404,7 +467,7 @@ func TestRecordsBasicTypes(t *testing.T) {
 	notShort(t)
 	db, closer := SpinOrientAndOpenDB(t, false)
 	defer closer()
-	defer catch()
+	defer catch(t)
 	SeedDB(t, db)
 
 	for _, cmd := range []string{
@@ -485,7 +548,7 @@ func TestRecordsBinaryField(t *testing.T) {
 	notShort(t)
 	db, closer := SpinOrientAndOpenDB(t, false)
 	defer closer()
-	defer catch()
+	defer catch(t)
 	SeedDB(t, db)
 
 	err := db.Command(orient.NewSQLCommand("CREATE PROPERTY Cat.bin BINARY")).Err()
@@ -571,7 +634,7 @@ func TestRecordBytes(t *testing.T) {
 	notShort(t)
 	db, closer := SpinOrientAndOpenDB(t, false)
 	defer closer()
-	defer catch()
+	defer catch(t)
 
 	rec := orient.NewBytesRecord()
 
@@ -635,7 +698,7 @@ func TestCommandsNativeAPI(t *testing.T) {
 	notShort(t)
 	db, closer := SpinOrientAndOpenDB(t, false)
 	defer closer()
-	defer catch()
+	defer catch(t)
 	SeedDB(t, db)
 
 	var (
@@ -737,8 +800,6 @@ func TestCommandsNativeAPI(t *testing.T) {
 	Equals(t, "Linus", nameField.Value)
 	Equals(t, int32(15), ageField.Value)
 	Equals(t, "Michael", caretakerField.Value)
-
-	glog.Infof("docs returned by RID: %v\n", *(docs[0]))
 
 	// ---[ cluster data range ]---
 	//	begin, end, err := db.FetchClusterDataRange("cat")
@@ -843,7 +904,7 @@ func TestCommandsNativeAPI(t *testing.T) {
 	defer func() {
 		err = db.Command(orient.NewSQLCommand("DROP CLASS Patient")).Err()
 		if err != nil {
-			glog.Warningf("WARN: clean up error: %v\n", err)
+			log.Printf("WARN: clean up error: %v\n", err)
 			return
 		}
 
@@ -1413,7 +1474,7 @@ func TestClusterNativeAPI(t *testing.T) {
 	notShort(t)
 	db, closer := SpinOrientAndOpenDB(t, false)
 	defer closer()
-	defer catch()
+	defer catch(t)
 	SeedDB(t, db)
 
 	cnt1, err := db.ClustersCount(true, "default", "index", "ouser")

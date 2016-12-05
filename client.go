@@ -4,9 +4,33 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
-const poolLimit = 6
+const concurrentRetriesDefault = 5
+
+var (
+	concurrentRetries = concurrentRetriesDefault
+)
+
+// SetRetryCountConcurrent sets a retry count when ErrConcurrentModification occurs.
+//
+// n == 0 - use default value
+//
+// n < 0 - no limit for retries
+//
+// n > 0 - maximum of n retries
+func SetRetryCountConcurrent(n int) {
+	if n == 0 {
+		n = concurrentRetriesDefault
+	} else if n < 0 {
+		n = -1
+	}
+	concurrentRetries = n
+}
+
+// MaxConnections limits the number of opened connections.
+var MaxConnections = 6
 
 // FetchPlan is an additional parameter to queries, that instructs DB how to handle linked documents.
 //
@@ -58,16 +82,20 @@ func Dial(addr string) (*Client, error) {
 }
 
 func newConnPool(size int, dial func() (DBSession, error)) *connPool {
-	if size <= 0 {
-		size = poolLimit
+	if size == 0 {
+		size = MaxConnections
 	}
 	p := &connPool{
 		dial: dial,
-		ch:   make(chan DBSession, size),
-		toks: make(chan struct{}, size),
 	}
-	for i := 0; i < size; i++ {
-		p.toks <- struct{}{}
+	if size > 0 {
+		p.ch = make(chan DBSession, size)
+		p.toks = make(chan struct{}, size)
+		for i := 0; i < size; i++ {
+			p.toks <- struct{}{}
+		}
+	} else {
+		p.ch = make(chan DBSession, 10)
 	}
 	return p
 }
@@ -79,27 +107,34 @@ type connPool struct {
 }
 
 func (p *connPool) getConn() (DBSession, error) {
+	var dt <-chan time.Time
+	if p.toks == nil {
+		dt = time.After(time.Millisecond * 100)
+	}
 	select {
 	case conn := <-p.ch:
 		return conn, nil
 	case <-p.toks:
-		if p.dial == nil {
-			return nil, nil
-		}
-		conn, err := p.dial()
-		if err != nil {
-			return nil, err
-		}
-		return conn, nil
+	case <-dt:
 	}
+	if p.dial == nil {
+		return nil, nil
+	}
+	conn, err := p.dial()
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 func (p *connPool) putConn(conn DBSession) {
 	select {
 	case p.ch <- conn:
 	default:
-		select {
-		case p.toks <- struct{}{}:
-		default:
+		if p.toks != nil {
+			select {
+			case p.toks <- struct{}{}:
+			default:
+			}
 		}
 		conn.Close()
 	}
@@ -144,11 +179,24 @@ func (c *Client) Auth(user, pass string) (*Admin, error) {
 	return &Admin{c, m}, nil
 }
 
+type sessionAndConn struct {
+	DBSession
+	conn DBConnection
+}
+
+func (s sessionAndConn) Close() error {
+	err := s.DBSession.Close()
+	if err1 := s.conn.Close(); err == nil {
+		err = err1
+	}
+	return err
+}
+
 // Open initiates a new database session, allowing to make queries to selected database.
 //
 // For database management use Auth instead.
 func (c *Client) Open(name string, dbType DatabaseType, user, pass string) (*Database, error) {
-	db := &Database{newConnPool(poolLimit, func() (DBSession, error) {
+	db := &Database{pool: newConnPool(0, func() (DBSession, error) {
 		conn, err := c.dial()
 		if err != nil {
 			return nil, err
@@ -158,8 +206,8 @@ func (c *Client) Open(name string, dbType DatabaseType, user, pass string) (*Dat
 			conn.Close()
 			return nil, err
 		}
-		return ds, nil
-	}), c}
+		return sessionAndConn{DBSession: ds, conn: conn}, nil
+	}), cli: c}
 	conn, err := db.pool.getConn()
 	if err != nil {
 		return nil, err
@@ -228,7 +276,9 @@ func (db *Database) Size() (int64, error) {
 
 // Close closes database session.
 func (db *Database) Close() error {
-	db.pool.clear()
+	if db != nil && db.pool != nil {
+		db.pool.clear()
+	}
 	return nil
 }
 
@@ -254,12 +304,17 @@ func (db *Database) GetCurDB() *ODatabase {
 
 // AddCluster creates new cluster with given name and returns its ID.
 func (db *Database) AddCluster(name string) (int16, error) {
+	return db.AddClusterWithID(name, -1) // -1 means generate new cluster id
+}
+
+// AddClusterWithID creates new cluster with given cluster position and name
+func (db *Database) AddClusterWithID(name string, clusterID int16) (int16, error) {
 	conn, err := db.pool.getConn()
 	if err != nil {
 		return 0, err
 	}
 	defer db.pool.putConn(conn)
-	return conn.AddCluster(name)
+	return conn.AddClusterWithID(name, clusterID)
 }
 
 // DropCluster deletes cluster from database
@@ -353,9 +408,18 @@ func (db *Database) Command(cmd OCommandRequestText) Results {
 		return errorResult{err: err}
 	}
 	defer db.pool.putConn(conn)
-	result, err := conn.Command(cmd)
+	var result interface{}
+	for i := 0; concurrentRetries < 0 || i < concurrentRetries; i++ {
+		result, err = conn.Command(cmd)
+		err = convertError(err)
+		switch err.(type) {
+		case ErrConcurrentModification:
+			continue
+		}
+		break
+	}
 	if err != nil {
-		return errorResult{err: err}
+		return errorResult{err: convertError(err)}
 	}
 	return newResults(result)
 }

@@ -1,6 +1,24 @@
 package orient
 
-import "bytes"
+import (
+	"bytes"
+	"fmt"
+)
+
+var (
+	exceptions = make(map[string]func(e Exception) Exception)
+)
+
+// RegException registers a function to convert server exception based on it's class.
+func RegException(class string, fnc func(e Exception) Exception) {
+	exceptions[class] = fnc
+}
+
+func init() {
+	RegException("com.orientechnologies.orient.core.exception.OConcurrentModificationException", func(e Exception) Exception {
+		return ErrConcurrentModification{e}
+	})
+}
 
 // Exception is an interface for Java-based Exceptions.
 type Exception interface {
@@ -56,4 +74,39 @@ type ErrInvalidConn struct {
 
 func (e ErrInvalidConn) Error() string {
 	return "Invalid Connection: %s" + e.Msg
+}
+
+// ErrNoRecord is returned when trying to deserialize an empty result set into a single value.
+var ErrNoRecord = fmt.Errorf("no records returned, while expecting one")
+
+// ErrMultipleRecords is returned when trying to deserialize a result set with multiple records into a single value.
+type ErrMultipleRecords struct {
+	N   int
+	Err error
+}
+
+func (e ErrMultipleRecords) Error() string {
+	return fmt.Sprintf("multiple records returned (%d), while expecting one: %s", e.N, e.Err)
+}
+
+func convertError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errs, ok := err.(OServerException); ok {
+		for _, e := range errs.Exceptions {
+			if fnc, ok := exceptions[e.ExcClass()]; ok {
+				return fnc(e)
+			}
+		}
+	}
+	return err
+}
+
+type ErrConcurrentModification struct {
+	Exception
+}
+
+func (e ErrConcurrentModification) Error() string {
+	return fmt.Sprintf("concurrent modification: %v", e.Exception)
 }
